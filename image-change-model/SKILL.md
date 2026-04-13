@@ -90,7 +90,7 @@ wf run 694caf01b7c2c3990ca7b8bf \
 - `--input_data`
   - 一个 JSON array。通常直接使用第一步输出的完整 JSON。
 - `--llm_model`
-  - 最终图片生成模型。默认值是 `google/gemini-3-pro-image-preview`。
+  - 最终图片生成模型。默认值是 `google/gemini-3.1-flash-image-preview`。
 
 ### `input_data` 需要包含的字段
 
