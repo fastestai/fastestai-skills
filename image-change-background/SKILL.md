@@ -148,6 +148,10 @@ wf run 694e206fc1c0b24dc831ad8b \
 3. 把这个 JSON array 原样传给第二步 workflow `694e206fc1c0b24dc831ad8b` 的 `--input_data`。
 4. 读取第二步输出里的 `url`，这就是最终生成图。
 
+## 构图对齐建议
+
+如果图片里只有一个人物，可以先对人像进行构图对齐（参考 `image-person-reframe` skill），把人物放置到合适的位置和比例，再执行换背景。这样最终合成效果会更自然、更符合视觉预期。
+
 ## 推荐的执行心智
 
 - 不要单独手写第二步的 `final_prompt`。先跑第一步，让 workflow 生成它。
