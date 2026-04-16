@@ -121,6 +121,9 @@ class CoarseResult:
 @dataclass
 class QCReport:
     overall_status: str
+    quality_score: float | None
+    score_breakdown: dict[str, Any]
+    decision_reasons: list[str]
     summary: dict[str, Any]
     coarse: CoarseResult
     dimensions: list[DimensionResult]
@@ -134,6 +137,9 @@ class QCReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "overall_status": self.overall_status,
+            "quality_score": self.quality_score,
+            "score_breakdown": self.score_breakdown,
+            "decision_reasons": list(self.decision_reasons),
             "summary": self.summary,
             "coarse": self.coarse.to_dict(),
             "dimensions": [dimension.to_dict() for dimension in self.dimensions],

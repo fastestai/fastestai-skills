@@ -63,6 +63,13 @@ If a source is local, the script uploads it with the sibling `cos-upload` skill 
    - the script-rendered markdown fallback report
    - an agent-written natural summary based on the final JSON
 
+The final JSON includes both:
+
+- `quality_score`: a script-calculated score meant to reflect overall completion quality
+- `overall_status`: the business decision result (`pass`, `fail`, or `uncertain`)
+
+These are intentionally separate. A result may have a moderate score but still fail business rules because a key item failed.
+
 Read [references/rubric.md](references/rubric.md) when changing scoring logic.
 Read the matching `references/prompt-*.md` files when changing evaluator behavior.
 Read [references/agent-summary.md](references/agent-summary.md) when the user wants a more natural human summary.

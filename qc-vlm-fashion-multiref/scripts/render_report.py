@@ -28,6 +28,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.append("# QC Report")
     lines.append("")
     lines.append(f"Final result: `{_fmt_status(overall_status)}`")
+    if report.get("quality_score") is not None:
+        lines.append(f"Quality score: `{report['quality_score']:.2f}/100`")
     lines.append(f"Quick check: `{_fmt_status(coarse.get('status', 'uncertain'))}`")
 
     metadata = report.get("metadata") or {}
@@ -35,6 +37,13 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(f"Model: `{metadata['model']}`")
     if metadata.get("generated_at"):
         lines.append(f"Generated at: `{metadata['generated_at']}`")
+
+    decision_reasons = list(report.get("decision_reasons") or [])
+    if decision_reasons:
+        lines.append("")
+        lines.append("## Why It Was Marked This Way")
+        for reason in decision_reasons:
+            lines.append(f"- {reason}")
 
     failure_summaries = list(summary.get("failures") or [])
     uncertain_summaries = list(summary.get("uncertain_or_missing") or [])
@@ -53,7 +62,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     if failure_summaries:
         lines.append("")
-        lines.append("## Failed Areas")
+        lines.append("## Failed Checks")
         for item in failure_summaries:
             lines.append(
                 f"- `{item.get('dimension', 'unknown')}`: {item.get('summary', '').strip()}"
@@ -61,7 +70,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     if uncertain_summaries:
         lines.append("")
-        lines.append("## Needs Review Or Missing Input")
+        lines.append("## Checks That Need Review")
         for item in uncertain_summaries:
             lines.append(
                 f"- `{item.get('dimension', 'unknown')}`: {item.get('summary', '').strip()}"
@@ -69,10 +78,16 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     if dimensions:
         lines.append("")
-        lines.append("## Results By Area")
+        lines.append("## Results By Check")
         for dimension in dimensions:
+            dimension_score = _find_dimension_score(
+                report.get("score_breakdown") or {}, dimension["dimension"]
+            )
+            score_suffix = (
+                f" ({dimension_score:.0f}/100)" if dimension_score is not None else ""
+            )
             lines.append(
-                f"- `{dimension['dimension']}`: `{_fmt_status(dimension['status'])}`"
+                f"- `{dimension['dimension']}`: `{_fmt_status(dimension['status'])}`{score_suffix}"
             )
 
         detailed_dimensions = [
@@ -104,3 +119,10 @@ def render_markdown(report: dict[str, Any]) -> str:
                 )
 
     return "\n".join(lines).strip() + "\n"
+
+
+def _find_dimension_score(score_breakdown: dict[str, Any], dimension_name: str) -> float | None:
+    for row in score_breakdown.get("dimensions") or []:
+        if row.get("dimension") == dimension_name:
+            return row.get("score")
+    return None
