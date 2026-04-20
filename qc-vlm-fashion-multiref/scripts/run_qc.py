@@ -32,7 +32,6 @@ ROLE_NAMES = [
     "pose_reference",
     "background_reference",
 ]
-REQUIRED_ROLES = {"result", "model_reference", "garment_reference"}
 PROMPT_DIR = SCRIPT_DIR.parent / "references"
 COS_UPLOAD_SCRIPT = (
     SCRIPT_DIR.parent.parent / "cos-upload" / "scripts" / "cos_upload.py"
@@ -56,6 +55,8 @@ DIMENSION_SPECS = {
             "garment_shape",
             "pattern_details",
             "material_texture",
+            "transparency_distribution",
+            "hem_length_and_edge",
             "garment_color",
             "wearing_naturalness",
         ],
@@ -95,6 +96,7 @@ DIMENSION_SPECS = {
         ],
     },
 }
+CHECK_NAMES = list(DIMENSION_SPECS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -111,6 +113,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pose-reference")
     parser.add_argument("--background-reference")
+    parser.add_argument(
+        "--checks",
+        help=(
+            "Comma-separated checks to run. "
+            f"Available: {', '.join(CHECK_NAMES)}. "
+            "If omitted, the script auto-selects every check supported by the provided inputs."
+        ),
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--mcp-url")
     parser.add_argument("--wf-binary", default="wf")
@@ -166,10 +176,58 @@ def build_role_to_source(args: argparse.Namespace) -> dict[str, str]:
     return role_to_source
 
 
-def validate_required_roles(role_to_source: dict[str, str]) -> None:
-    missing = sorted(REQUIRED_ROLES - set(role_to_source))
-    if missing:
-        raise ValueError(f"Missing required roles: {', '.join(missing)}")
+def parse_requested_checks(raw: str | None) -> list[str] | None:
+    if raw is None:
+        return None
+    checks = [item.strip() for item in raw.split(",") if item.strip()]
+    if not checks:
+        raise ValueError("`--checks` was provided but no check names were found.")
+
+    unknown = [item for item in checks if item not in DIMENSION_SPECS]
+    if unknown:
+        raise ValueError(
+            f"Unknown checks: {', '.join(unknown)}. "
+            f"Available checks: {', '.join(CHECK_NAMES)}"
+        )
+
+    unique_checks: list[str] = []
+    for item in checks:
+        if item not in unique_checks:
+            unique_checks.append(item)
+    return unique_checks
+
+
+def resolve_selected_checks(
+    role_to_source: dict[str, str],
+    requested_checks: list[str] | None,
+) -> tuple[list[str], str]:
+    available_roles = set(role_to_source)
+
+    if requested_checks is not None:
+        required_roles = {
+            role
+            for check in requested_checks
+            for role in DIMENSION_SPECS[check]["roles"]
+        }
+        missing_roles = sorted(required_roles - available_roles)
+        if missing_roles:
+            raise ValueError(
+                "The selected checks need more inputs. Missing roles: "
+                f"{', '.join(missing_roles)}"
+            )
+        return requested_checks, "explicit"
+
+    auto_checks = [
+        check
+        for check in CHECK_NAMES
+        if all(role in available_roles for role in DIMENSION_SPECS[check]["roles"])
+    ]
+    if not auto_checks:
+        raise ValueError(
+            "No checks can run with the provided inputs. "
+            f"Available checks are: {', '.join(CHECK_NAMES)}"
+        )
+    return auto_checks, "auto"
 
 
 def is_url(value: str) -> bool:
@@ -206,8 +264,6 @@ def ensure_public_url(source: str, upload_prefix: str, role: str) -> tuple[str, 
 
 
 def normalize_inputs(role_to_source: dict[str, str], upload_prefix: str) -> NormalizedInputs:
-    validate_required_roles(role_to_source)
-
     role_to_url: dict[str, str] = {}
     source_cache: dict[str, tuple[str, bool]] = {}
     images_by_source: dict[str, InputImage] = {}
@@ -267,17 +323,30 @@ def dimension_schema(dimension: str, item_names: list[str]) -> dict[str, Any]:
     }
 
 
-def build_coarse_message(inputs: NormalizedInputs) -> tuple[list[str], str]:
-    ordered_roles = [
-        "result",
-        "model_reference",
-        "garment_reference",
-        "pose_reference",
-        "background_reference",
-    ]
+def garment_fingerprint_schema() -> dict[str, Any]:
+    return {
+        "silhouette_and_structure": "Precise description of silhouette, neckline, upper structure, and body fit.",
+        "pattern_and_surface_details": "Visible glitter, seams, ruching, pleats, or other construction details.",
+        "material_and_sheen": "Fabric weight, sheen type, surface grain, stretch, and drape behavior.",
+        "transparency_map": "Which garment regions are opaque, semi-sheer, or sheer.",
+        "hem_length_and_edge": "Visible length, hem edge type, lower-layer behavior, and pooling or no pooling.",
+        "color_profile": "Main color and tonal behavior.",
+    }
+
+
+def build_coarse_message(
+    selected_checks: list[str],
+    inputs: NormalizedInputs,
+) -> tuple[list[str], str]:
+    relevant_roles = {"result"}
+    for check in selected_checks:
+        relevant_roles.update(DIMENSION_SPECS[check]["roles"])
+
+    ordered_roles = [role for role in ROLE_NAMES if role in relevant_roles]
     image_urls: list[str] = []
     lines = [
-        "Evaluate the following images as a coarse QC gate for a generated fashion image.",
+        "Evaluate the following images as a quick first-pass QC check.",
+        f"Only judge these checks: {', '.join(selected_checks)}.",
         "Image order and roles:",
     ]
     seen_urls: set[str] = set()
@@ -315,6 +384,57 @@ def build_dimension_message(dimension: str, inputs: NormalizedInputs) -> tuple[l
         lines.append(f"{index}. {role}")
     lines.append("Return JSON only.")
     return image_urls, "\n".join(lines)
+
+
+def build_garment_reference_message(inputs: NormalizedInputs) -> tuple[list[str], str]:
+    garment_url = inputs.role_to_url["garment_reference"]
+    lines = [
+        "Analyze only the garment reference image and extract a structured garment fingerprint.",
+        "Focus especially on transparency placement, lining placement, hem length, and lower edge behavior.",
+        "Image order and roles:",
+        "1. garment_reference",
+        "Return JSON only.",
+    ]
+    return [garment_url], "\n".join(lines)
+
+
+def build_garment_verification_message(
+    inputs: NormalizedInputs,
+    garment_fingerprint: dict[str, Any],
+) -> tuple[list[str], str]:
+    garment_url = inputs.role_to_url["garment_reference"]
+    result_url = inputs.role_to_url["result"]
+    lines = [
+        "Evaluate only garment consistency using the garment fingerprint below as the main checklist.",
+        "If the generated garment changes transparency placement, lining placement, or hem length in a meaningful way, the related item must not be pass.",
+        "Garment fingerprint:",
+        json.dumps(garment_fingerprint, ensure_ascii=False, indent=2),
+        "Image order and roles:",
+        "1. garment_reference",
+        "2. result",
+        "Return JSON only.",
+    ]
+    return [garment_url, result_url], "\n".join(lines)
+
+
+def build_garment_mismatch_message(
+    inputs: NormalizedInputs,
+    garment_fingerprint: dict[str, Any],
+) -> tuple[list[str], str]:
+    garment_url = inputs.role_to_url["garment_reference"]
+    result_url = inputs.role_to_url["result"]
+    lines = [
+        "Find meaningful garment mismatches using the garment fingerprint below as the checklist.",
+        "Focus on local mismatches even if the overall garment looks similar.",
+        "If transparency placement, lining placement, or hem length clearly changed, the related item must not be pass.",
+        "Garment fingerprint:",
+        json.dumps(garment_fingerprint, ensure_ascii=False, indent=2),
+        "Image order and roles:",
+        "1. garment_reference",
+        "2. result",
+        "Return JSON only.",
+    ]
+    return [garment_url, result_url], "\n".join(lines)
 
 
 def invoke_with_retry(
@@ -375,9 +495,111 @@ def skipped_dimension_result(dimension: str) -> dict[str, Any]:
     }
 
 
+def merge_garment_payloads(
+    verify_payload: dict[str, Any],
+    mismatch_payload: dict[str, Any],
+    item_names: list[str],
+) -> dict[str, Any]:
+    verify_items = {
+        item.get("name"): item
+        for item in verify_payload.get("items") or []
+        if isinstance(item, dict) and item.get("name")
+    }
+    mismatch_items = {
+        item.get("name"): item
+        for item in mismatch_payload.get("items") or []
+        if isinstance(item, dict) and item.get("name")
+    }
+
+    merged_items: list[dict[str, Any]] = []
+    for item_name in item_names:
+        verify_item = verify_items.get(item_name, {})
+        mismatch_item = mismatch_items.get(item_name, {})
+        verify_status = str(verify_item.get("status", "uncertain")).strip() or "uncertain"
+        mismatch_status = str(mismatch_item.get("status", "uncertain")).strip() or "uncertain"
+        verify_reason = _short_reason(verify_item.get("reason", ""))
+        mismatch_reason = _short_reason(mismatch_item.get("reason", ""))
+
+        if mismatch_status == "fail":
+            merged_status = "fail"
+            merged_reason = mismatch_reason or verify_reason or "A meaningful mismatch was found."
+        elif verify_status == "fail":
+            merged_status = "fail"
+            merged_reason = verify_reason or mismatch_reason or "A meaningful mismatch was found."
+        elif mismatch_status == "uncertain" or verify_status == "uncertain":
+            merged_status = "uncertain"
+            merged_reason = mismatch_reason or verify_reason or "The evidence was mixed."
+        else:
+            merged_status = "pass"
+            merged_reason = verify_reason or mismatch_reason or "No meaningful mismatch was found."
+
+        merged_items.append(
+            {
+                "name": item_name,
+                "status": merged_status,
+                "reason": merged_reason,
+            }
+        )
+
+    statuses = [item["status"] for item in merged_items]
+    if "fail" in statuses:
+        merged_status = "fail"
+    elif "uncertain" in statuses:
+        merged_status = "uncertain"
+    else:
+        merged_status = "pass"
+
+    summary = _merge_garment_summary(
+        verify_payload.get("summary", ""),
+        mismatch_payload.get("summary", ""),
+        merged_status,
+    )
+
+    return {
+        "dimension": "garment",
+        "status": merged_status,
+        "summary": summary or "Combined garment verification result.",
+        "confidence": "high" if merged_status != "uncertain" else "medium",
+        "items": merged_items,
+    }
+
+
+def _short_reason(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = " ".join(text.split())
+    if len(text) <= 180:
+        return text
+    sentence_endings = [". ", "; ", " However", " But "]
+    for token in sentence_endings:
+        index = text.find(token)
+        if index > 40:
+            return text[: index + (1 if token in {". ", "; "} else 0)].strip()
+    return text[:177].rstrip() + "..."
+
+
+def _merge_garment_summary(
+    verify_summary: Any,
+    mismatch_summary: Any,
+    merged_status: str,
+) -> str:
+    verify_text = _short_reason(verify_summary)
+    mismatch_text = _short_reason(mismatch_summary)
+    if merged_status == "fail":
+        return mismatch_text or verify_text
+    if merged_status == "uncertain":
+        return mismatch_text or verify_text or "The garment evidence was mixed."
+    return verify_text or mismatch_text or "The garment matches the reference."
+
+
 def run() -> int:
     args = parse_args()
     role_to_source = build_role_to_source(args)
+    requested_checks = parse_requested_checks(args.checks)
+    selected_checks, selection_mode = resolve_selected_checks(
+        role_to_source, requested_checks
+    )
     inputs = normalize_inputs(role_to_source, args.upload_prefix)
 
     client = WFMultimodalClient(
@@ -385,8 +607,9 @@ def run() -> int:
         default_model=args.model,
         wf_binary=args.wf_binary,
     )
+    intermediate_artifacts: dict[str, Any] = {}
 
-    coarse_images, coarse_message = build_coarse_message(inputs)
+    coarse_images, coarse_message = build_coarse_message(selected_checks, inputs)
     coarse_payload = invoke_with_retry(
         client=client,
         prompt=load_prompt("prompt-coarse.md"),
@@ -408,11 +631,14 @@ def run() -> int:
                 "generated_at": utc_timestamp(),
                 "model": args.model,
                 "mode": "coarse_only",
+                "selected_checks": selected_checks,
+                "check_selection_mode": selection_mode,
             },
         )
     else:
         skip_detailed = coarse.status == "fail" and not args.force_detailed
-        for dimension, spec in DIMENSION_SPECS.items():
+        for dimension in selected_checks:
+            spec = DIMENSION_SPECS[dimension]
             missing_roles = [
                 role for role in spec["roles"] if role not in inputs.role_to_url
             ]
@@ -421,15 +647,62 @@ def run() -> int:
             elif skip_detailed:
                 payload = skipped_dimension_result(dimension)
             else:
-                prompt = load_prompt(spec["prompt_file"])
-                images, message = build_dimension_message(dimension, inputs)
-                payload = invoke_with_retry(
-                    client=client,
-                    prompt=prompt,
-                    message=message,
-                    images=images,
-                    response_schema=dimension_schema(dimension, spec["items"]),
-                )
+                if dimension == "garment":
+                    garment_reference_payload = invoke_with_retry(
+                        client=client,
+                        prompt=load_prompt("prompt-garment-fingerprint.md"),
+                        message=build_garment_reference_message(inputs)[1],
+                        images=build_garment_reference_message(inputs)[0],
+                        response_schema=garment_fingerprint_schema(),
+                    )
+                    if not isinstance(garment_reference_payload, dict):
+                        garment_reference_payload = {
+                            "raw_result": garment_reference_payload
+                        }
+                    intermediate_artifacts["garment_reference_fingerprint"] = (
+                        garment_reference_payload
+                    )
+                    prompt = load_prompt(spec["prompt_file"])
+                    images, message = build_garment_verification_message(
+                        inputs, garment_reference_payload
+                    )
+                    verify_payload = invoke_with_retry(
+                        client=client,
+                        prompt=prompt,
+                        message=message,
+                        images=images,
+                        response_schema=dimension_schema(dimension, spec["items"]),
+                    )
+                    mismatch_payload = invoke_with_retry(
+                        client=client,
+                        prompt=load_prompt("prompt-garment-mismatch.md"),
+                        message=build_garment_mismatch_message(
+                            inputs, garment_reference_payload
+                        )[1],
+                        images=build_garment_mismatch_message(
+                            inputs, garment_reference_payload
+                        )[0],
+                        response_schema=dimension_schema(dimension, spec["items"]),
+                    )
+                    if not isinstance(verify_payload, dict):
+                        verify_payload = {"raw_result": verify_payload}
+                    if not isinstance(mismatch_payload, dict):
+                        mismatch_payload = {"raw_result": mismatch_payload}
+                    intermediate_artifacts["garment_verify_payload"] = verify_payload
+                    intermediate_artifacts["garment_mismatch_payload"] = mismatch_payload
+                    payload = merge_garment_payloads(
+                        verify_payload, mismatch_payload, spec["items"]
+                    )
+                else:
+                    prompt = load_prompt(spec["prompt_file"])
+                    images, message = build_dimension_message(dimension, inputs)
+                    payload = invoke_with_retry(
+                        client=client,
+                        prompt=prompt,
+                        message=message,
+                        images=images,
+                        response_schema=dimension_schema(dimension, spec["items"]),
+                    )
                 if not isinstance(payload, dict):
                     payload = {
                         "dimension": dimension,
@@ -456,6 +729,9 @@ def run() -> int:
                 "model": args.model,
                 "mode": "coarse_plus_detailed",
                 "force_detailed": args.force_detailed,
+                "selected_checks": selected_checks,
+                "check_selection_mode": selection_mode,
+                "intermediate_artifacts": intermediate_artifacts,
             },
         )
 

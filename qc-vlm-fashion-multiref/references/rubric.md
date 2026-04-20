@@ -17,7 +17,9 @@ Compare the generated result against the garment reference.
 
 - `garment_shape`: garment silhouette, cut, and structure
 - `pattern_details`: prints, seams, buttons, and other visible details
-- `material_texture`: material feel and texture
+- `material_texture`: fabric feel, sheen, thickness, surface grain, and drape behavior
+- `transparency_distribution`: where the garment is transparent versus opaque, including lining and sheer layer placement
+- `hem_length_and_edge`: visible hem length, lower edge shape, and lower-layer behavior
 - `garment_color`: main color fidelity and obvious color cast
 - `wearing_naturalness`: fit, drape, and absence of clipping or deformation
 

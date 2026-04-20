@@ -14,6 +14,7 @@ Use this skill when the user wants a reusable QC workflow that:
 - compares a generated result image against one or more references
 - supports `result`, `model_reference`, `garment_reference`, `pose_reference`, and `background_reference`
 - allows one image to carry multiple roles, such as a shared pose/background reference
+- can run either the full QC set or only selected checks such as `background` or `identity`
 - uses `wf` tool `llm-multimodal-invoke` as the multimodal backend
 
 ## Inputs
@@ -22,9 +23,9 @@ The skill is role-based, not count-based.
 
 Required roles:
 
-- `result`
-- `model_reference`
-- `garment_reference`
+- There is no single global required role set anymore.
+- The required roles are inferred from the checks being run.
+- `result` is required by every current check.
 
 Optional roles:
 
@@ -50,14 +51,11 @@ If a source is local, the script uploads it with the sibling `cos-upload` skill 
 
 1. Normalize input roles.
 2. Resolve all image sources to public URLs.
-3. Run a coarse gate over all available references and the result image.
-4. If coarse result is not a hard fail, or if `--force-detailed` is set, run per-dimension evaluators:
-   - identity
-   - garment
-   - pose
-   - background
-   - fusion
-   - quality
+3. Decide which checks to run.
+   - If `--checks` is provided, run exactly those checks.
+   - If `--checks` is omitted, auto-select every check supported by the provided inputs.
+4. Run a quick first-pass check over the selected checks.
+5. If the quick check result is not a hard fail, or if `--force-detailed` is set, run the selected detailed evaluators.
 5. Aggregate all dimension results into a single structured JSON report.
 6. Optionally produce two human-facing views:
    - the script-rendered markdown fallback report
@@ -106,6 +104,7 @@ python .agents/skills/qc-vlm-fashion-multiref/scripts/run_qc.py \
 
 Useful flags:
 
+- `--checks identity,background`: run only the selected checks
 - `--force-detailed`: continue into detailed evaluators even if coarse stage already failed
 - `--coarse-only`: stop after the coarse gate
 - `--stdout-format markdown|json|both`: choose what is printed to stdout; default is markdown
@@ -116,7 +115,8 @@ Useful flags:
 ## Notes
 
 - The script assumes one source per role. One source may serve multiple roles, but one role may not map to multiple different sources.
-- Missing optional roles do not crash the flow. Their dimension results are emitted as `missing_input`.
+- If `--checks` is omitted, the script auto-selects every check supported by the provided inputs.
+- If `--checks` is provided, the script validates that all required roles for those checks are present.
 - The script-rendered markdown is a stable fallback report.
 - When the user wants a better human-facing summary, the agent should read the final JSON and write a short natural-language report using `references/agent-summary.md`.
 - Keep the JSON as the source of truth. The agent summary must not override it.
