@@ -47,6 +47,13 @@ Each image source may be either:
 If a source is already a URL, the script uses it directly.
 If a source is local, the script uploads it with the sibling `cos-upload` skill and then uses the returned public URL.
 
+For the local `pose_compare` stage:
+
+- the comparator uses the original `pose_reference` and `result` sources, not the uploaded URLs
+- local image paths are read directly
+- remote image URLs are downloaded to a temp file for comparison
+- DWPose ONNX models are auto-downloaded into a cache if they are not already available locally
+
 ## Default workflow
 
 1. Normalize input roles.
@@ -55,9 +62,11 @@ If a source is local, the script uploads it with the sibling `cos-upload` skill 
    - If `--checks` is provided, run exactly those checks.
    - If `--checks` is omitted, auto-select every check supported by the provided inputs.
 4. Run a quick first-pass check over the selected checks.
-5. If the quick check result is not a hard fail, or if `--force-detailed` is set, run the selected detailed evaluators.
-5. Aggregate all dimension results into a single structured JSON report.
-6. Optionally produce two human-facing views:
+   - If `pose` or `quality` is selected, run a best-effort local DWPose structure check on the result image to look for missing or extra limb/finger artifacts.
+5. If `pose` is selected, run a best-effort local `pose_compare` stage as auxiliary evidence for pose and framing.
+6. If the quick check result is not a hard fail, or if `--force-detailed` is set, run the selected detailed evaluators.
+7. Aggregate all dimension results into a single structured JSON report.
+8. Optionally produce two human-facing views:
    - the script-rendered markdown fallback report
    - an agent-written natural summary based on the final JSON
 
@@ -107,6 +116,10 @@ Useful flags:
 - `--checks identity,background`: run only the selected checks
 - `--force-detailed`: continue into detailed evaluators even if coarse stage already failed
 - `--coarse-only`: stop after the coarse gate
+- `--pose-models-dir PATH`: prefer DWPose ONNX files from this directory before using cache
+- `--pose-cache-dir PATH`: override the persistent cache location for auto-downloaded DWPose models
+- `--pose-debug-dir PATH`: save the pose comparator debug panel image into this directory
+- `--disable-pose-compare`: skip the local pose comparator and use only the VLM pose evaluator
 - `--stdout-format markdown|json|both`: choose what is printed to stdout; default is markdown
 - `--output-json PATH`: write the structured JSON report to a file
 - `--output-md PATH`: write the human-readable markdown report to a file
@@ -117,6 +130,8 @@ Useful flags:
 - The script assumes one source per role. One source may serve multiple roles, but one role may not map to multiple different sources.
 - If `--checks` is omitted, the script auto-selects every check supported by the provided inputs.
 - If `--checks` is provided, the script validates that all required roles for those checks are present.
+- The local `pose_compare` stage is best-effort. If import, model download, image download, or pose detection fails, the workflow records that artifact and falls back to the VLM pose evaluator.
+- The coarse gate also uses a best-effort local DWPose structure heuristic for obvious limb and finger defects when `pose` or `quality` is being judged.
 - The script-rendered markdown is a stable fallback report.
 - When the user wants a better human-facing summary, the agent should read the final JSON and write a short natural-language report using `references/agent-summary.md`.
 - Keep the JSON as the source of truth. The agent summary must not override it.

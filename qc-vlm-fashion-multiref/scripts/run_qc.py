@@ -14,6 +14,19 @@ if str(SCRIPT_DIR) not in sys.path:
 
 # ruff: noqa: E402
 from aggregate import build_report
+try:
+    from pose_compare import (
+        PoseCompareError,
+        compare_pose_sources,
+        inspect_pose_structure_source,
+    )
+except Exception as exc:  # noqa: BLE001
+    PoseCompareError = RuntimeError
+    compare_pose_sources = None
+    inspect_pose_structure_source = None
+    POSE_COMPARE_IMPORT_ERROR: Exception | None = exc
+else:
+    POSE_COMPARE_IMPORT_ERROR = None
 from render_report import render_markdown
 from schema import (
     InputImage,
@@ -127,6 +140,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--upload-prefix", default="qc-vlm-fashion-multiref")
     parser.add_argument("--force-detailed", action="store_true")
     parser.add_argument("--coarse-only", action="store_true")
+    parser.add_argument(
+        "--pose-models-dir",
+        help="Preferred directory for DWPose ONNX models used by pose_compare.",
+    )
+    parser.add_argument(
+        "--pose-cache-dir",
+        help="Persistent cache directory for auto-downloaded pose_compare models.",
+    )
+    parser.add_argument(
+        "--pose-debug-dir",
+        help="Optional directory for pose comparison debug images.",
+    )
+    parser.add_argument(
+        "--disable-pose-compare",
+        action="store_true",
+        help="Disable the local pose_compare stage and use only the VLM pose evaluator.",
+    )
     parser.add_argument(
         "--stdout-format",
         choices=["markdown", "json", "both"],
@@ -337,6 +367,7 @@ def garment_fingerprint_schema() -> dict[str, Any]:
 def build_coarse_message(
     selected_checks: list[str],
     inputs: NormalizedInputs,
+    extra_context: list[str] | None = None,
 ) -> tuple[list[str], str]:
     relevant_roles = {"result"}
     for check in selected_checks:
@@ -365,11 +396,18 @@ def build_coarse_message(
         role_label = ", ".join(same_source_roles)
         lines.append(f"{counter}. {role_label}")
         counter += 1
+    if extra_context:
+        lines.append("Additional context:")
+        lines.extend(extra_context)
     lines.append("Return JSON only.")
     return image_urls, "\n".join(lines)
 
 
-def build_dimension_message(dimension: str, inputs: NormalizedInputs) -> tuple[list[str], str]:
+def build_dimension_message(
+    dimension: str,
+    inputs: NormalizedInputs,
+    extra_context: list[str] | None = None,
+) -> tuple[list[str], str]:
     spec = DIMENSION_SPECS[dimension]
     image_urls: list[str] = []
     lines = [
@@ -382,6 +420,9 @@ def build_dimension_message(dimension: str, inputs: NormalizedInputs) -> tuple[l
             continue
         image_urls.append(url)
         lines.append(f"{index}. {role}")
+    if extra_context:
+        lines.append("Additional context:")
+        lines.extend(extra_context)
     lines.append("Return JSON only.")
     return image_urls, "\n".join(lines)
 
@@ -593,6 +634,264 @@ def _merge_garment_summary(
     return verify_text or mismatch_text or "The garment matches the reference."
 
 
+def build_pose_compare_context(pose_compare_payload: dict[str, Any]) -> list[str]:
+    models = pose_compare_payload.get("models") or {}
+    return [
+        "A local pose comparator also analyzed pose geometry as auxiliary evidence.",
+        (
+            "Metrics: "
+            f"overall_score={pose_compare_payload.get('overall_score')}, "
+            f"angle_similarity={pose_compare_payload.get('angle_similarity')}, "
+            f"position_similarity={pose_compare_payload.get('position_similarity')}, "
+            f"visibility_ratio={pose_compare_payload.get('visibility_ratio')}, "
+            f"matched_keypoints={pose_compare_payload.get('matched_keypoints')}/"
+            f"{pose_compare_payload.get('total_keypoints')}."
+        ),
+        (
+            "Treat these metrics as supporting evidence for overall pose and framing, "
+            "but do not use them as the sole basis for hand or head detail judgments."
+        ),
+        (
+            "Model sources: "
+            f"det={models.get('det_model_source', 'unknown')}, "
+            f"pose={models.get('pose_model_source', 'unknown')}."
+        ),
+    ]
+
+
+def build_coarse_structure_context(structure_payload: dict[str, Any]) -> list[str]:
+    issues = list(structure_payload.get("issues") or [])
+    lines = [
+        "A local DWPose structure check inspected the result image for missing or extra limb and finger artifacts.",
+        f"Local structural status: {structure_payload.get('status', 'unknown')}.",
+    ]
+    for issue in issues[:3]:
+        message = str(issue.get("message") or "").strip()
+        if message:
+            lines.append(f"- {message}")
+    if not issues:
+        lines.append("- No obvious limb or finger structural anomaly was detected locally.")
+    return lines
+
+
+def should_run_coarse_structure_check(selected_checks: list[str]) -> bool:
+    return any(check in {"pose", "quality"} for check in selected_checks)
+
+
+def run_coarse_structure_check(
+    args: argparse.Namespace,
+    role_to_source: dict[str, str],
+    selected_checks: list[str],
+) -> dict[str, Any] | None:
+    if args.disable_pose_compare or not should_run_coarse_structure_check(selected_checks):
+        return None
+    result_source = role_to_source.get("result")
+    if not result_source:
+        return {
+            "status": "missing_input",
+            "summary": "Local structure check requires the result image.",
+        }
+    if inspect_pose_structure_source is None:
+        return {
+            "status": "unavailable",
+            "summary": f"pose_compare import failed: {POSE_COMPARE_IMPORT_ERROR}",
+        }
+    try:
+        payload = inspect_pose_structure_source(
+            result_source,
+            models_dir=args.pose_models_dir,
+            cache_dir=args.pose_cache_dir,
+        )
+    except (PoseCompareError, FileNotFoundError, OSError, ValueError) as exc:
+        return {"status": "error", "summary": str(exc)}
+    return payload
+
+
+def merge_coarse_payloads(
+    vlm_payload: dict[str, Any],
+    structure_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not structure_payload or structure_payload.get("status") not in {"fail", "uncertain"}:
+        return vlm_payload
+
+    merged_payload = dict(vlm_payload)
+    obvious_failures = list(vlm_payload.get("obvious_failures") or [])
+    suspect_dimensions = list(vlm_payload.get("suspect_dimensions") or [])
+
+    for item in structure_payload.get("obvious_failures") or []:
+        if item not in obvious_failures:
+            obvious_failures.append(item)
+    for item in structure_payload.get("suspect_dimensions") or []:
+        if item not in suspect_dimensions:
+            suspect_dimensions.append(item)
+
+    structure_status = str(structure_payload.get("status") or "uncertain")
+    merged_status = str(vlm_payload.get("status") or "uncertain")
+    if structure_status == "fail":
+        merged_status = "fail"
+    elif merged_status == "pass":
+        merged_status = "uncertain"
+
+    structure_summary = str(structure_payload.get("summary") or "").strip()
+    base_summary = str(vlm_payload.get("summary") or "").strip()
+    if base_summary and structure_summary:
+        merged_summary = f"{base_summary} Local structure check: {structure_summary}"
+    else:
+        merged_summary = base_summary or structure_summary
+
+    merged_payload["status"] = merged_status
+    merged_payload["summary"] = merged_summary
+    merged_payload["obvious_failures"] = obvious_failures
+    merged_payload["suspect_dimensions"] = suspect_dimensions
+    return merged_payload
+
+
+def run_pose_compare(
+    args: argparse.Namespace,
+    role_to_source: dict[str, str],
+) -> dict[str, Any]:
+    pose_source = role_to_source.get("pose_reference")
+    result_source = role_to_source.get("result")
+    if args.disable_pose_compare:
+        return {"status": "disabled", "summary": "Pose comparator was disabled by flag."}
+    if not pose_source or not result_source:
+        return {
+            "status": "missing_input",
+            "summary": "Pose comparator requires both pose_reference and result.",
+        }
+    if compare_pose_sources is None:
+        return {
+            "status": "unavailable",
+            "summary": f"pose_compare import failed: {POSE_COMPARE_IMPORT_ERROR}",
+        }
+
+    output_path = None
+    if args.pose_debug_dir:
+        output_path = (
+            Path(args.pose_debug_dir).expanduser().resolve() / "pose_compare_debug.png"
+        )
+
+    try:
+        payload = compare_pose_sources(
+            pose_source,
+            result_source,
+            models_dir=args.pose_models_dir,
+            cache_dir=args.pose_cache_dir,
+            output_path=output_path,
+        )
+    except (PoseCompareError, FileNotFoundError, OSError, ValueError) as exc:
+        return {"status": "error", "summary": str(exc)}
+
+    payload["status"] = "ok"
+    payload["summary"] = (
+        f"Pose score {payload['overall_score']}/100, "
+        f"angle {round(float(payload['angle_similarity']) * 100, 1)}, "
+        f"position {round(float(payload['position_similarity']) * 100, 1)}, "
+        f"visibility {round(float(payload['visibility_ratio']) * 100, 1)}."
+    )
+    return payload
+
+
+def merge_pose_payloads(
+    vlm_payload: dict[str, Any],
+    pose_compare_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not pose_compare_payload or pose_compare_payload.get("status") != "ok":
+        return vlm_payload
+
+    items = [
+        dict(item)
+        for item in (vlm_payload.get("items") or [])
+        if isinstance(item, dict)
+    ]
+    item_lookup = {
+        str(item.get("name", "")).strip(): item
+        for item in items
+        if str(item.get("name", "")).strip()
+    }
+
+    score = float(pose_compare_payload.get("overall_score") or 0.0)
+    angle = float(pose_compare_payload.get("angle_similarity") or 0.0)
+    position = float(pose_compare_payload.get("position_similarity") or 0.0)
+    visibility = float(pose_compare_payload.get("visibility_ratio") or 0.0)
+    matched = int(pose_compare_payload.get("matched_keypoints") or 0)
+    total = int(pose_compare_payload.get("total_keypoints") or 23)
+
+    if matched < 8 or visibility < 0.35:
+        comparator_status = "uncertain"
+        comparator_reason = (
+            "The local pose comparator had limited confident joints, so pose evidence is incomplete."
+        )
+    elif score < 45 or (angle < 0.42 and position < 0.42):
+        comparator_status = "fail"
+        comparator_reason = (
+            f"The local pose comparator found a strong mismatch "
+            f"(score {score:.1f}/100, angle {angle * 100:.1f}, position {position * 100:.1f})."
+        )
+    elif score < 70 or angle < 0.68 or position < 0.62:
+        comparator_status = "uncertain"
+        comparator_reason = (
+            f"The local pose comparator found a partial mismatch "
+            f"(score {score:.1f}/100, angle {angle * 100:.1f}, position {position * 100:.1f})."
+        )
+    else:
+        comparator_status = "pass"
+        comparator_reason = (
+            f"The local pose comparator found strong geometric alignment "
+            f"(score {score:.1f}/100, matched joints {matched}/{total})."
+        )
+
+    overall_item = item_lookup.get("overall_pose")
+    if overall_item is not None:
+        current_status = str(overall_item.get("status") or "uncertain")
+        if comparator_status == "fail":
+            overall_item["status"] = "fail"
+            overall_item["reason"] = comparator_reason
+        elif comparator_status == "uncertain" and current_status == "pass":
+            overall_item["status"] = "uncertain"
+            overall_item["reason"] = comparator_reason
+        elif comparator_status == "pass" and not str(overall_item.get("reason", "")).strip():
+            overall_item["reason"] = comparator_reason
+
+    framing_item = item_lookup.get("framing_proportion")
+    if framing_item is not None:
+        if position < 0.45 and visibility >= 0.45:
+            framing_item["status"] = "fail"
+            framing_item["reason"] = (
+                f"The local pose comparator found a strong framing or body placement mismatch "
+                f"(position similarity {position * 100:.1f})."
+            )
+        elif position < 0.65 and str(framing_item.get("status") or "") == "pass":
+            framing_item["status"] = "uncertain"
+            framing_item["reason"] = (
+                f"The local pose comparator found some framing drift "
+                f"(position similarity {position * 100:.1f})."
+            )
+
+    statuses = {str(item.get("status") or "uncertain") for item in items}
+    merged_status = str(vlm_payload.get("status") or "uncertain")
+    if "fail" in statuses:
+        merged_status = "fail"
+    elif "uncertain" in statuses and merged_status == "pass":
+        merged_status = "uncertain"
+
+    summary_suffix = (
+        f" Local pose comparator: score {score:.1f}/100, "
+        f"angle {angle * 100:.1f}, position {position * 100:.1f}, visibility {visibility * 100:.1f}."
+    )
+    summary = str(vlm_payload.get("summary") or "").strip()
+    if summary:
+        summary = f"{summary}{summary_suffix}"
+    else:
+        summary = f"Pose evaluation summary.{summary_suffix}"
+
+    merged_payload = dict(vlm_payload)
+    merged_payload["status"] = merged_status
+    merged_payload["summary"] = summary
+    merged_payload["items"] = items
+    return merged_payload
+
+
 def run() -> int:
     args = parse_args()
     role_to_source = build_role_to_source(args)
@@ -609,7 +908,23 @@ def run() -> int:
     )
     intermediate_artifacts: dict[str, Any] = {}
 
-    coarse_images, coarse_message = build_coarse_message(selected_checks, inputs)
+    coarse_structure_payload = run_coarse_structure_check(
+        args,
+        role_to_source,
+        selected_checks,
+    )
+    if coarse_structure_payload is not None:
+        intermediate_artifacts["coarse_structure_check"] = coarse_structure_payload
+    coarse_context = (
+        build_coarse_structure_context(coarse_structure_payload)
+        if coarse_structure_payload and coarse_structure_payload.get("status") in {"fail", "uncertain"}
+        else None
+    )
+    coarse_images, coarse_message = build_coarse_message(
+        selected_checks,
+        inputs,
+        extra_context=coarse_context,
+    )
     coarse_payload = invoke_with_retry(
         client=client,
         prompt=load_prompt("prompt-coarse.md"),
@@ -619,6 +934,7 @@ def run() -> int:
     )
     if not isinstance(coarse_payload, dict):
         coarse_payload = {"status": "uncertain", "summary": f"Unexpected coarse payload: {coarse_payload}"}
+    coarse_payload = merge_coarse_payloads(coarse_payload, coarse_structure_payload)
     coarse = build_coarse_result(coarse_payload)
 
     dimensions = []
@@ -693,6 +1009,28 @@ def run() -> int:
                     payload = merge_garment_payloads(
                         verify_payload, mismatch_payload, spec["items"]
                     )
+                elif dimension == "pose":
+                    pose_compare_payload = run_pose_compare(args, role_to_source)
+                    intermediate_artifacts["pose_compare"] = pose_compare_payload
+                    prompt = load_prompt(spec["prompt_file"])
+                    pose_context = []
+                    if pose_compare_payload.get("status") == "ok":
+                        pose_context = build_pose_compare_context(pose_compare_payload)
+                    images, message = build_dimension_message(
+                        dimension,
+                        inputs,
+                        extra_context=pose_context,
+                    )
+                    payload = invoke_with_retry(
+                        client=client,
+                        prompt=prompt,
+                        message=message,
+                        images=images,
+                        response_schema=dimension_schema(dimension, spec["items"]),
+                    )
+                    if not isinstance(payload, dict):
+                        payload = {"raw_result": payload}
+                    payload = merge_pose_payloads(payload, pose_compare_payload)
                 else:
                     prompt = load_prompt(spec["prompt_file"])
                     images, message = build_dimension_message(dimension, inputs)

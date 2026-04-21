@@ -6,6 +6,7 @@ Rules:
 
 - Use only the provided images and role labels.
 - Look for obvious, material problems.
+- Pay special attention to visible human-structure defects such as extra or missing limbs, hands, or fingers when the result image shows a person.
 - Judge only the checks explicitly named in the user message.
 - Ignore checks that are not named in the user message.
 - Do not produce a full report here.
