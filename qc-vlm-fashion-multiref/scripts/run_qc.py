@@ -14,6 +14,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 # ruff: noqa: E402
 from aggregate import build_report
+
 try:
     from pose_compare import (
         PoseCompareError,
@@ -116,7 +117,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run multi-reference VLM QC for generated fashion images."
     )
-    parser.add_argument("--input-json", help="Inline JSON string or path to a JSON file.")
+    parser.add_argument(
+        "--input-json", help="Inline JSON string or path to a JSON file."
+    )
     parser.add_argument("--result")
     parser.add_argument("--model-reference")
     parser.add_argument("--garment-reference")
@@ -178,7 +181,11 @@ def load_json_input(raw: str) -> dict[str, Any]:
 def build_role_to_source(args: argparse.Namespace) -> dict[str, str]:
     if args.input_json:
         payload = load_json_input(args.input_json)
-        images = payload["images"] if isinstance(payload, dict) and "images" in payload else payload
+        images = (
+            payload["images"]
+            if isinstance(payload, dict) and "images" in payload
+            else payload
+        )
         role_to_source: dict[str, str] = {}
         for image in images:
             source = image["source"]
@@ -273,9 +280,7 @@ def ensure_public_url(source: str, upload_prefix: str, role: str) -> tuple[str, 
     if not source_path.exists():
         raise FileNotFoundError(f"Image source not found: {source}")
     if not COS_UPLOAD_SCRIPT.exists():
-        raise FileNotFoundError(
-            f"COS upload script not found: {COS_UPLOAD_SCRIPT}"
-        )
+        raise FileNotFoundError(f"COS upload script not found: {COS_UPLOAD_SCRIPT}")
 
     scoped_prefix = f"{upload_prefix}/{role}/"
     completed = subprocess.run(
@@ -293,7 +298,9 @@ def ensure_public_url(source: str, upload_prefix: str, role: str) -> tuple[str, 
     return completed.stdout.strip(), True
 
 
-def normalize_inputs(role_to_source: dict[str, str], upload_prefix: str) -> NormalizedInputs:
+def normalize_inputs(
+    role_to_source: dict[str, str], upload_prefix: str
+) -> NormalizedInputs:
     role_to_url: dict[str, str] = {}
     source_cache: dict[str, tuple[str, bool]] = {}
     images_by_source: dict[str, InputImage] = {}
@@ -556,23 +563,35 @@ def merge_garment_payloads(
     for item_name in item_names:
         verify_item = verify_items.get(item_name, {})
         mismatch_item = mismatch_items.get(item_name, {})
-        verify_status = str(verify_item.get("status", "uncertain")).strip() or "uncertain"
-        mismatch_status = str(mismatch_item.get("status", "uncertain")).strip() or "uncertain"
+        verify_status = (
+            str(verify_item.get("status", "uncertain")).strip() or "uncertain"
+        )
+        mismatch_status = (
+            str(mismatch_item.get("status", "uncertain")).strip() or "uncertain"
+        )
         verify_reason = _short_reason(verify_item.get("reason", ""))
         mismatch_reason = _short_reason(mismatch_item.get("reason", ""))
 
         if mismatch_status == "fail":
             merged_status = "fail"
-            merged_reason = mismatch_reason or verify_reason or "A meaningful mismatch was found."
+            merged_reason = (
+                mismatch_reason or verify_reason or "A meaningful mismatch was found."
+            )
         elif verify_status == "fail":
             merged_status = "fail"
-            merged_reason = verify_reason or mismatch_reason or "A meaningful mismatch was found."
+            merged_reason = (
+                verify_reason or mismatch_reason or "A meaningful mismatch was found."
+            )
         elif mismatch_status == "uncertain" or verify_status == "uncertain":
             merged_status = "uncertain"
-            merged_reason = mismatch_reason or verify_reason or "The evidence was mixed."
+            merged_reason = (
+                mismatch_reason or verify_reason or "The evidence was mixed."
+            )
         else:
             merged_status = "pass"
-            merged_reason = verify_reason or mismatch_reason or "No meaningful mismatch was found."
+            merged_reason = (
+                verify_reason or mismatch_reason or "No meaningful mismatch was found."
+            )
 
         merged_items.append(
             {
@@ -636,16 +655,30 @@ def _merge_garment_summary(
 
 def build_pose_compare_context(pose_compare_payload: dict[str, Any]) -> list[str]:
     models = pose_compare_payload.get("models") or {}
+    comparability = pose_compare_payload.get("comparability") or {}
+    confidence = pose_compare_payload.get("comparison_confidence") or {}
+    dimensions = pose_compare_payload.get("dimensions") or {}
     return [
         "A local pose comparator also analyzed pose geometry as auxiliary evidence.",
         (
             "Metrics: "
             f"overall_score={pose_compare_payload.get('overall_score')}, "
+            f"comparability={comparability.get('label')}({comparability.get('score')}), "
+            f"confidence={confidence.get('label')}({confidence.get('score')}), "
             f"angle_similarity={pose_compare_payload.get('angle_similarity')}, "
             f"position_similarity={pose_compare_payload.get('position_similarity')}, "
+            f"torso_similarity={pose_compare_payload.get('torso_similarity')}, "
             f"visibility_ratio={pose_compare_payload.get('visibility_ratio')}, "
             f"matched_keypoints={pose_compare_payload.get('matched_keypoints')}/"
             f"{pose_compare_payload.get('total_keypoints')}."
+        ),
+        (
+            "Body-region metrics: "
+            f"upper_body_pose={dimensions.get('upper_body_pose')}, "
+            f"lower_body_pose={dimensions.get('lower_body_pose')}, "
+            f"torso_projection={dimensions.get('torso_projection')}, "
+            f"upper_visibility={pose_compare_payload.get('upper_body_visibility')}, "
+            f"lower_visibility={pose_compare_payload.get('lower_body_visibility')}."
         ),
         (
             "Treat these metrics as supporting evidence for overall pose and framing, "
@@ -670,7 +703,9 @@ def build_coarse_structure_context(structure_payload: dict[str, Any]) -> list[st
         if message:
             lines.append(f"- {message}")
     if not issues:
-        lines.append("- No obvious limb or finger structural anomaly was detected locally.")
+        lines.append(
+            "- No obvious limb or finger structural anomaly was detected locally."
+        )
     return lines
 
 
@@ -683,7 +718,9 @@ def run_coarse_structure_check(
     role_to_source: dict[str, str],
     selected_checks: list[str],
 ) -> dict[str, Any] | None:
-    if args.disable_pose_compare or not should_run_coarse_structure_check(selected_checks):
+    if args.disable_pose_compare or not should_run_coarse_structure_check(
+        selected_checks
+    ):
         return None
     result_source = role_to_source.get("result")
     if not result_source:
@@ -711,7 +748,10 @@ def merge_coarse_payloads(
     vlm_payload: dict[str, Any],
     structure_payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if not structure_payload or structure_payload.get("status") not in {"fail", "uncertain"}:
+    if not structure_payload or structure_payload.get("status") not in {
+        "fail",
+        "uncertain",
+    }:
         return vlm_payload
 
     merged_payload = dict(vlm_payload)
@@ -753,7 +793,10 @@ def run_pose_compare(
     pose_source = role_to_source.get("pose_reference")
     result_source = role_to_source.get("result")
     if args.disable_pose_compare:
-        return {"status": "disabled", "summary": "Pose comparator was disabled by flag."}
+        return {
+            "status": "disabled",
+            "summary": "Pose comparator was disabled by flag.",
+        }
     if not pose_source or not result_source:
         return {
             "status": "missing_input",
@@ -783,8 +826,14 @@ def run_pose_compare(
         return {"status": "error", "summary": str(exc)}
 
     payload["status"] = "ok"
+    comparability = payload.get("comparability") or {}
+    confidence = payload.get("comparison_confidence") or {}
     payload["summary"] = (
         f"Pose score {payload['overall_score']}/100, "
+        f"comparability {comparability.get('label', 'unknown')} "
+        f"({comparability.get('score', 'n/a')}), "
+        f"confidence {confidence.get('label', 'unknown')} "
+        f"({confidence.get('score', 'n/a')}), "
         f"angle {round(float(payload['angle_similarity']) * 100, 1)}, "
         f"position {round(float(payload['position_similarity']) * 100, 1)}, "
         f"visibility {round(float(payload['visibility_ratio']) * 100, 1)}."
@@ -813,32 +862,74 @@ def merge_pose_payloads(
     score = float(pose_compare_payload.get("overall_score") or 0.0)
     angle = float(pose_compare_payload.get("angle_similarity") or 0.0)
     position = float(pose_compare_payload.get("position_similarity") or 0.0)
+    torso = float(pose_compare_payload.get("torso_similarity") or 0.0)
     visibility = float(pose_compare_payload.get("visibility_ratio") or 0.0)
+    upper_visibility = float(pose_compare_payload.get("upper_body_visibility") or 0.0)
+    lower_visibility = float(pose_compare_payload.get("lower_body_visibility") or 0.0)
     matched = int(pose_compare_payload.get("matched_keypoints") or 0)
     total = int(pose_compare_payload.get("total_keypoints") or 23)
+    comparability = float(
+        ((pose_compare_payload.get("comparability") or {}).get("score")) or 0.0
+    )
+    confidence = float(
+        ((pose_compare_payload.get("comparison_confidence") or {}).get("score")) or 0.0
+    )
+    dimension_scores = pose_compare_payload.get("dimensions") or {}
+    upper_body_pose = float(dimension_scores.get("upper_body_pose") or 0.0) / 100.0
+    lower_body_pose = float(dimension_scores.get("lower_body_pose") or 0.0) / 100.0
+    torso_projection = float(dimension_scores.get("torso_projection") or 0.0) / 100.0
 
-    if matched < 8 or visibility < 0.35:
+    if (
+        matched < 8
+        or upper_visibility < 0.45
+        or visibility < 0.35
+        or comparability < 55.0
+        or confidence < 45.0
+    ):
         comparator_status = "uncertain"
         comparator_reason = (
-            "The local pose comparator had limited confident joints, so pose evidence is incomplete."
+            "The local pose comparator had limited comparability or confidence, "
+            "so pose evidence is incomplete."
         )
-    elif score < 45 or (angle < 0.42 and position < 0.42):
+    elif (
+        score < 45
+        or (angle < 0.42 and position < 0.42)
+        or (upper_body_pose < 0.45 and torso_projection < 0.45)
+        or (
+            lower_visibility >= 0.45
+            and lower_body_pose < 0.38
+            and position < 0.48
+            and confidence >= 60.0
+        )
+    ):
         comparator_status = "fail"
         comparator_reason = (
             f"The local pose comparator found a strong mismatch "
-            f"(score {score:.1f}/100, angle {angle * 100:.1f}, position {position * 100:.1f})."
+            f"(score {score:.1f}/100, upper {upper_body_pose * 100:.1f}, "
+            f"position {position * 100:.1f}, torso {torso_projection * 100:.1f})."
         )
-    elif score < 70 or angle < 0.68 or position < 0.62:
+    elif (
+        score < 70
+        or angle < 0.68
+        or position < 0.62
+        or upper_body_pose < 0.72
+        or torso_projection < 0.62
+        or (lower_visibility >= 0.45 and lower_body_pose < 0.6)
+        or comparability < 75.0
+        or confidence < 65.0
+    ):
         comparator_status = "uncertain"
         comparator_reason = (
             f"The local pose comparator found a partial mismatch "
-            f"(score {score:.1f}/100, angle {angle * 100:.1f}, position {position * 100:.1f})."
+            f"(score {score:.1f}/100, upper {upper_body_pose * 100:.1f}, "
+            f"position {position * 100:.1f}, torso {torso_projection * 100:.1f})."
         )
     else:
         comparator_status = "pass"
         comparator_reason = (
             f"The local pose comparator found strong geometric alignment "
-            f"(score {score:.1f}/100, matched joints {matched}/{total})."
+            f"(score {score:.1f}/100, comparability {comparability:.1f}, "
+            f"confidence {confidence:.1f}, matched joints {matched}/{total})."
         )
 
     overall_item = item_lookup.get("overall_pose")
@@ -850,22 +941,34 @@ def merge_pose_payloads(
         elif comparator_status == "uncertain" and current_status == "pass":
             overall_item["status"] = "uncertain"
             overall_item["reason"] = comparator_reason
-        elif comparator_status == "pass" and not str(overall_item.get("reason", "")).strip():
+        elif (
+            comparator_status == "pass"
+            and not str(overall_item.get("reason", "")).strip()
+        ):
             overall_item["reason"] = comparator_reason
 
     framing_item = item_lookup.get("framing_proportion")
     if framing_item is not None:
-        if position < 0.45 and visibility >= 0.45:
+        if (
+            position < 0.45
+            and upper_visibility >= 0.6
+            and comparability >= 60.0
+            and confidence >= 55.0
+        ):
             framing_item["status"] = "fail"
             framing_item["reason"] = (
                 f"The local pose comparator found a strong framing or body placement mismatch "
                 f"(position similarity {position * 100:.1f})."
             )
-        elif position < 0.65 and str(framing_item.get("status") or "") == "pass":
+        elif (
+            (position < 0.65 or torso < 0.62)
+            and confidence >= 45.0
+            and str(framing_item.get("status") or "") == "pass"
+        ):
             framing_item["status"] = "uncertain"
             framing_item["reason"] = (
                 f"The local pose comparator found some framing drift "
-                f"(position similarity {position * 100:.1f})."
+                f"(position similarity {position * 100:.1f}, torso {torso * 100:.1f})."
             )
 
     statuses = {str(item.get("status") or "uncertain") for item in items}
@@ -877,6 +980,8 @@ def merge_pose_payloads(
 
     summary_suffix = (
         f" Local pose comparator: score {score:.1f}/100, "
+        f"comparability {comparability:.1f}, confidence {confidence:.1f}, "
+        f"upper {upper_body_pose * 100:.1f}, lower {lower_body_pose * 100:.1f}, "
         f"angle {angle * 100:.1f}, position {position * 100:.1f}, visibility {visibility * 100:.1f}."
     )
     summary = str(vlm_payload.get("summary") or "").strip()
@@ -917,7 +1022,8 @@ def run() -> int:
         intermediate_artifacts["coarse_structure_check"] = coarse_structure_payload
     coarse_context = (
         build_coarse_structure_context(coarse_structure_payload)
-        if coarse_structure_payload and coarse_structure_payload.get("status") in {"fail", "uncertain"}
+        if coarse_structure_payload
+        and coarse_structure_payload.get("status") in {"fail", "uncertain"}
         else None
     )
     coarse_images, coarse_message = build_coarse_message(
@@ -933,7 +1039,10 @@ def run() -> int:
         response_schema=coarse_schema(),
     )
     if not isinstance(coarse_payload, dict):
-        coarse_payload = {"status": "uncertain", "summary": f"Unexpected coarse payload: {coarse_payload}"}
+        coarse_payload = {
+            "status": "uncertain",
+            "summary": f"Unexpected coarse payload: {coarse_payload}",
+        }
     coarse_payload = merge_coarse_payloads(coarse_payload, coarse_structure_payload)
     coarse = build_coarse_result(coarse_payload)
 
@@ -1005,7 +1114,9 @@ def run() -> int:
                     if not isinstance(mismatch_payload, dict):
                         mismatch_payload = {"raw_result": mismatch_payload}
                     intermediate_artifacts["garment_verify_payload"] = verify_payload
-                    intermediate_artifacts["garment_mismatch_payload"] = mismatch_payload
+                    intermediate_artifacts["garment_mismatch_payload"] = (
+                        mismatch_payload
+                    )
                     payload = merge_garment_payloads(
                         verify_payload, mismatch_payload, spec["items"]
                     )

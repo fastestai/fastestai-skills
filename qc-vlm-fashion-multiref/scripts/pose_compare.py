@@ -103,7 +103,9 @@ def ensure_model_file(
     configured_dir = models_dir or os.environ.get("QC_VLM_FASHION_MULTIREF_DWPOSE_DIR")
     if configured_dir:
         candidates.append(Path(configured_dir).expanduser().resolve())
-    cache_path = Path(cache_dir).expanduser().resolve() if cache_dir else default_cache_dir()
+    cache_path = (
+        Path(cache_dir).expanduser().resolve() if cache_dir else default_cache_dir()
+    )
     if cache_path not in candidates:
         candidates.append(cache_path)
 
@@ -149,7 +151,9 @@ def resolve_models_dir(
     cache_dir: str | Path | None = None,
     timeout_seconds: int = 600,
 ) -> dict[str, Any]:
-    cache_path = Path(cache_dir).expanduser().resolve() if cache_dir else default_cache_dir()
+    cache_path = (
+        Path(cache_dir).expanduser().resolve() if cache_dir else default_cache_dir()
+    )
     det_path, det_source = ensure_model_file(
         "yolox_l.onnx",
         models_dir=models_dir,
@@ -648,6 +652,10 @@ def draw_dwpose(
 
 BODY_KEYPOINT_IDS = tuple(range(23))
 TORSO_IDS = (5, 6, 11, 12)
+UPPER_BODY_IDS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+LOWER_BODY_IDS = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
+LOWER_POSE_IDS = (11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
+ANCHOR_CANDIDATE_IDS = (5, 6, 11, 12, 0)
 
 POSITION_WEIGHTS = {
     0: 0.8,
@@ -683,6 +691,24 @@ ANGLE_SEGMENTS = (
     ((5, 11), 0.8),
     ((6, 12), 0.8),
     ((5, 6), 0.7),
+    ((11, 12), 0.7),
+)
+
+UPPER_BODY_ANGLE_SEGMENTS = (
+    ((5, 7), 1.0),
+    ((7, 9), 1.1),
+    ((6, 8), 1.0),
+    ((8, 10), 1.1),
+    ((5, 6), 0.7),
+    ((5, 11), 0.6),
+    ((6, 12), 0.6),
+)
+
+LOWER_BODY_ANGLE_SEGMENTS = (
+    ((11, 13), 1.2),
+    ((13, 15), 1.3),
+    ((12, 14), 1.2),
+    ((14, 16), 1.3),
     ((11, 12), 0.7),
 )
 
@@ -727,7 +753,12 @@ MAJOR_LIMB_CHAINS = {
 
 HAND_SPECS = {
     "left_hand": {"offset": 91, "wrist_idx": 9, "elbow_idx": 7, "label": "left hand"},
-    "right_hand": {"offset": 112, "wrist_idx": 10, "elbow_idx": 8, "label": "right hand"},
+    "right_hand": {
+        "offset": 112,
+        "wrist_idx": 10,
+        "elbow_idx": 8,
+        "label": "right hand",
+    },
 }
 
 HAND_FINGER_CHAINS = {
@@ -756,13 +787,25 @@ class PoseDetection:
 @dataclass
 class PoseMetrics:
     overall_score: float
+    comparability_score: float
+    comparability_label: str
+    comparison_confidence_score: float
+    comparison_confidence_label: str
+    upper_body_similarity: float
+    lower_body_similarity: float
+    lower_body_reliability: float
+    torso_projection_similarity: float
     position_similarity: float
     angle_similarity: float
+    torso_similarity: float
     symmetry_similarity: float
     visibility_ratio: float
     matched_keypoints: int
     mean_position_distance: float
     mean_angle_difference: float
+    mean_torso_ratio_delta: float
+    upper_body_visibility: float
+    lower_body_visibility: float
 
 
 # ---------------------------------------------------------------------------
@@ -933,22 +976,121 @@ def _angle_difference(angle_a: float, angle_b: float) -> float:
     return min(diff, 360.0 - diff)
 
 
-def _procrustes_align(
-    pts_a: np.ndarray, pts_b: np.ndarray, shared_ids: list[int]
+def _torso_centers(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    shoulder_center = np.mean(points[[5, 6]], axis=0)
+    hip_center = np.mean(points[[11, 12]], axis=0)
+    torso_length = float(np.linalg.norm(shoulder_center - hip_center))
+    return shoulder_center, hip_center, torso_length
+
+
+def _torso_profile_features(points: np.ndarray, valid: np.ndarray) -> dict[str, float]:
+    if not (valid[5] and valid[6] and valid[11] and valid[12]):
+        return {}
+
+    shoulder_center, hip_center, torso_length = _torso_centers(points)
+    if torso_length <= 1e-6:
+        return {}
+
+    shoulder_width = float(np.linalg.norm(points[5] - points[6])) / torso_length
+    hip_width = float(np.linalg.norm(points[11] - points[12])) / torso_length
+    torso_shift = abs(float(shoulder_center[0] - hip_center[0])) / torso_length
+    return {
+        "shoulder_width_ratio": shoulder_width,
+        "hip_width_ratio": hip_width,
+        "torso_shift_ratio": torso_shift,
+    }
+
+
+def _shared_ids(
+    valid_a: np.ndarray, valid_b: np.ndarray, ids: tuple[int, ...]
+) -> list[int]:
+    return [idx for idx in ids if valid_a[idx] and valid_b[idx]]
+
+
+def _align_by_shared_anchor(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+    valid_a: np.ndarray,
+    valid_b: np.ndarray,
 ) -> np.ndarray:
-    a = np.array([pts_a[i] for i in shared_ids], dtype=np.float64)
-    b = np.array([pts_b[i] for i in shared_ids], dtype=np.float64)
-    centroid_a = a.mean(axis=0)
-    centroid_b = b.mean(axis=0)
-    a_c = a - centroid_a
-    b_c = b - centroid_b
-    H = a_c.T @ b_c
-    U, _, Vt = np.linalg.svd(H)
-    d = np.linalg.det(Vt.T @ U.T)
-    S = np.diag([1.0, 1.0 if d >= 0 else -1.0])
-    R = Vt.T @ S @ U.T
-    aligned = (pts_a - centroid_a) @ R.T + centroid_b
-    return aligned.astype(np.float32)
+    anchor_ids = _shared_ids(valid_a, valid_b, ANCHOR_CANDIDATE_IDS)
+    if len(anchor_ids) < 2:
+        anchor_ids = _shared_ids(valid_a, valid_b, UPPER_BODY_IDS)
+    if not anchor_ids:
+        return points_a
+
+    center_a = np.mean(points_a[anchor_ids], axis=0)
+    center_b = np.mean(points_b[anchor_ids], axis=0)
+    aligned = points_a - center_a[None, :]
+
+    if len(anchor_ids) >= 2:
+        radius_a = float(
+            np.mean(np.linalg.norm(points_a[anchor_ids] - center_a, axis=1))
+        )
+        radius_b = float(
+            np.mean(np.linalg.norm(points_b[anchor_ids] - center_b, axis=1))
+        )
+        if radius_a > 1e-6 and radius_b > 1e-6:
+            scale_ratio = radius_b / radius_a
+            scale_ratio = min(max(scale_ratio, 0.75), 1.33)
+            aligned = aligned * scale_ratio
+
+    return aligned + center_b[None, :]
+
+
+def _weighted_position_similarity(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+    ids: list[int],
+    distance_scale: float,
+) -> tuple[float, float]:
+    if not ids:
+        return 0.0, 1.0
+
+    diffs: list[float] = []
+    weights: list[float] = []
+    for idx in ids:
+        weight = POSITION_WEIGHTS.get(idx, 1.0)
+        diffs.append(float(np.linalg.norm(points_a[idx] - points_b[idx])))
+        weights.append(weight)
+
+    mean_distance = float(np.average(np.array(diffs), weights=np.array(weights)))
+    return math.exp(-mean_distance / distance_scale), mean_distance
+
+
+def _segment_similarity(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+    valid_a: np.ndarray,
+    valid_b: np.ndarray,
+    segments: tuple[tuple[tuple[int, int], float], ...],
+    angle_scale: float,
+) -> tuple[float, float]:
+    angle_diffs: list[float] = []
+    angle_weights: list[float] = []
+    for (start, end), weight in segments:
+        if not (valid_a[start] and valid_a[end] and valid_b[start] and valid_b[end]):
+            continue
+        angle_a = _segment_angle(points_a, start, end)
+        angle_b = _segment_angle(points_b, start, end)
+        angle_diffs.append(_angle_difference(angle_a, angle_b))
+        angle_weights.append(weight)
+
+    if not angle_diffs:
+        return 0.0, 180.0
+
+    mean_angle_difference = float(
+        np.average(np.array(angle_diffs), weights=np.array(angle_weights))
+    )
+    return math.exp(-mean_angle_difference / angle_scale), mean_angle_difference
+
+
+def _score_label(score: float) -> str:
+    if score >= 80.0:
+        return "high"
+    if score >= 55.0:
+        return "medium"
+    return "low"
 
 
 def score_pose_similarity(
@@ -956,44 +1098,92 @@ def score_pose_similarity(
 ) -> tuple[PoseMetrics, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     norm_a, valid_a, _, _ = normalize_pose(pose_a.keypoints, pose_a.scores, thr)
     norm_b, valid_b, _, _ = normalize_pose(pose_b.keypoints, pose_b.scores, thr)
+    aligned_a = _align_by_shared_anchor(norm_a, norm_b, valid_a, valid_b)
 
     shared_ids = [idx for idx in BODY_KEYPOINT_IDS if valid_a[idx] and valid_b[idx]]
     if not shared_ids:
         raise ValueError("The two images do not share any confident body keypoints")
 
-    aligned_a = _procrustes_align(norm_a, norm_b, shared_ids)
+    upper_shared_ids = _shared_ids(valid_a, valid_b, UPPER_BODY_IDS)
+    lower_shared_ids = _shared_ids(valid_a, valid_b, LOWER_BODY_IDS)
+    lower_pose_shared_ids = _shared_ids(valid_a, valid_b, LOWER_POSE_IDS)
+    torso_shared_ids = _shared_ids(valid_a, valid_b, TORSO_IDS)
 
-    pos_diffs: list[float] = []
-    pos_weights: list[float] = []
-    for idx in shared_ids:
-        weight = POSITION_WEIGHTS.get(idx, 1.0)
-        diff = float(np.linalg.norm(aligned_a[idx] - norm_b[idx]))
-        pos_diffs.append(diff)
-        pos_weights.append(weight)
-
-    mean_position_distance = float(
-        np.average(np.array(pos_diffs), weights=np.array(pos_weights))
+    full_position_similarity, mean_position_distance = _weighted_position_similarity(
+        aligned_a,
+        norm_b,
+        shared_ids,
+        distance_scale=0.16,
     )
-    position_similarity = math.exp(-mean_position_distance / 0.20)
-
-    angle_diffs: list[float] = []
-    angle_weights: list[float] = []
-    for (start, end), weight in ANGLE_SEGMENTS:
-        if not (valid_a[start] and valid_a[end] and valid_b[start] and valid_b[end]):
-            continue
-        angle_a = _segment_angle(aligned_a, start, end)
-        angle_b = _segment_angle(norm_b, start, end)
-        angle_diffs.append(_angle_difference(angle_a, angle_b))
-        angle_weights.append(weight)
-
-    if angle_diffs:
-        mean_angle_difference = float(
-            np.average(np.array(angle_diffs), weights=np.array(angle_weights))
+    upper_position_similarity, upper_position_distance = _weighted_position_similarity(
+        aligned_a,
+        norm_b,
+        upper_shared_ids,
+        distance_scale=0.22,
+    )
+    lower_position_similarity, _ = _weighted_position_similarity(
+        aligned_a,
+        norm_b,
+        lower_pose_shared_ids,
+        distance_scale=0.22,
+    )
+    lower_body_visibility = len(lower_shared_ids) / len(LOWER_BODY_IDS)
+    upper_body_visibility = len(upper_shared_ids) / len(UPPER_BODY_IDS)
+    if lower_body_visibility < 0.45 and upper_shared_ids:
+        position_similarity = (
+            0.85 * upper_position_similarity + 0.15 * full_position_similarity
         )
-        angle_similarity = math.exp(-mean_angle_difference / 50.0)
+        mean_position_distance = (
+            0.85 * upper_position_distance + 0.15 * mean_position_distance
+        )
     else:
-        mean_angle_difference = 180.0
-        angle_similarity = 0.0
+        position_similarity = full_position_similarity
+
+    full_angle_similarity, mean_angle_difference = _segment_similarity(
+        aligned_a,
+        norm_b,
+        valid_a,
+        valid_b,
+        ANGLE_SEGMENTS,
+        angle_scale=35.0,
+    )
+    upper_angle_similarity, upper_mean_angle_difference = _segment_similarity(
+        aligned_a,
+        norm_b,
+        valid_a,
+        valid_b,
+        UPPER_BODY_ANGLE_SEGMENTS,
+        angle_scale=45.0,
+    )
+    lower_angle_similarity, _ = _segment_similarity(
+        aligned_a,
+        norm_b,
+        valid_a,
+        valid_b,
+        LOWER_BODY_ANGLE_SEGMENTS,
+        angle_scale=45.0,
+    )
+    if lower_body_visibility < 0.45 and upper_angle_similarity > 0.0:
+        angle_similarity = 0.85 * upper_angle_similarity + 0.15 * full_angle_similarity
+        mean_angle_difference = (
+            0.85 * upper_mean_angle_difference + 0.15 * mean_angle_difference
+        )
+    else:
+        angle_similarity = full_angle_similarity
+
+    torso_features_a = _torso_profile_features(norm_a, valid_a)
+    torso_features_b = _torso_profile_features(norm_b, valid_b)
+    shared_torso_keys = sorted(set(torso_features_a) & set(torso_features_b))
+    torso_diffs = [
+        abs(torso_features_a[key] - torso_features_b[key]) for key in shared_torso_keys
+    ]
+    if torso_diffs:
+        mean_torso_ratio_delta = float(np.mean(torso_diffs))
+        torso_similarity = math.exp(-mean_torso_ratio_delta / 0.18)
+    else:
+        mean_torso_ratio_delta = 1.0
+        torso_similarity = 0.75 if upper_body_visibility >= 0.75 else 0.6
+    torso_projection_similarity = torso_similarity
 
     sym_diffs: list[float] = []
     for seg_l, seg_r in SYMMETRY_PAIRS:
@@ -1020,25 +1210,129 @@ def score_pose_similarity(
         sym_diffs.append(diff_a)
     symmetry_similarity = math.exp(-np.mean(sym_diffs) / 45.0) if sym_diffs else 1.0
 
-    visibility_ratio = len(shared_ids) / len(BODY_KEYPOINT_IDS)
+    visibility_ratio = 0.85 * upper_body_visibility + 0.15 * lower_body_visibility
+    upper_body_similarity = (
+        0.55 * upper_position_similarity + 0.45 * upper_angle_similarity
+    )
+    lower_body_raw_similarity = (
+        0.55 * lower_position_similarity + 0.45 * lower_angle_similarity
+    )
+    lower_body_reliability = min(lower_body_visibility / 0.5, 1.0)
+    if lower_body_visibility < 0.2:
+        lower_body_similarity = 0.75
+    elif lower_body_visibility < 0.45:
+        lower_body_similarity = (
+            lower_body_reliability * lower_body_raw_similarity
+            + (1.0 - lower_body_reliability) * 0.75
+        )
+    else:
+        lower_body_similarity = lower_body_raw_similarity
+
+    torso_coverage = len(torso_shared_ids) / len(TORSO_IDS)
+    comparability_score = 100.0 * (
+        0.45 * torso_coverage
+        + 0.35 * upper_body_visibility
+        + 0.20 * lower_body_visibility
+    )
+    comparability_label = _score_label(comparability_score)
+
+    shared_score_values = [
+        min(pose_a.scores[idx], pose_b.scores[idx]) for idx in shared_ids
+    ]
+    shared_score_quality = (
+        float(np.mean(shared_score_values)) if shared_score_values else 0.0
+    )
+    anchor_shared_ids = _shared_ids(valid_a, valid_b, ANCHOR_CANDIDATE_IDS)
+    anchor_score_values = [
+        min(pose_a.scores[idx], pose_b.scores[idx]) for idx in anchor_shared_ids
+    ]
+    anchor_quality = float(np.mean(anchor_score_values)) if anchor_score_values else 0.0
+    component_values = np.array(
+        [position_similarity, angle_similarity, torso_similarity],
+        dtype=np.float32,
+    )
+    consistency_quality = 1.0 - min(float(np.std(component_values)) / 0.25, 1.0)
+
+    comparison_confidence_score = 100.0
+    if torso_coverage < 0.5:
+        comparison_confidence_score -= 35.0
+    elif torso_coverage < 1.0:
+        comparison_confidence_score -= 10.0
+
+    if len(anchor_shared_ids) < 3:
+        comparison_confidence_score -= 25.0
+    elif len(anchor_shared_ids) < len(ANCHOR_CANDIDATE_IDS):
+        comparison_confidence_score -= 8.0
+
+    if anchor_quality < 0.5:
+        comparison_confidence_score -= 18.0
+    elif anchor_quality < 0.65:
+        comparison_confidence_score -= 8.0
+
+    if upper_body_visibility < 0.7:
+        comparison_confidence_score -= 25.0
+    elif upper_body_visibility < 0.9:
+        comparison_confidence_score -= 10.0
+
+    if len(shared_ids) < 10:
+        comparison_confidence_score -= 20.0
+    elif len(shared_ids) < 14:
+        comparison_confidence_score -= 10.0
+    elif len(shared_ids) < 18:
+        comparison_confidence_score -= 5.0
+
+    if shared_score_quality < 0.45:
+        comparison_confidence_score -= 25.0
+    elif shared_score_quality < 0.6:
+        comparison_confidence_score -= 12.0
+
+    if consistency_quality < 0.35:
+        comparison_confidence_score -= 20.0
+    elif consistency_quality < 0.55:
+        comparison_confidence_score -= 10.0
+
+    if lower_body_visibility < 0.1:
+        comparison_confidence_score -= 18.0
+    elif lower_body_visibility < 0.3:
+        comparison_confidence_score -= 10.0
+    elif lower_body_visibility < 0.5:
+        comparison_confidence_score -= 5.0
+
+    comparison_confidence_score = max(0.0, min(100.0, comparison_confidence_score))
+    comparison_confidence_label = _score_label(comparison_confidence_score)
 
     raw = (
-        0.50 * angle_similarity
-        + 0.40 * position_similarity
+        0.32 * angle_similarity
+        + 0.33 * position_similarity
+        + 0.25 * torso_similarity
         + 0.05 * visibility_ratio
         + 0.05 * symmetry_similarity
     )
-    overall_score = 100.0 / (1.0 + math.exp(-12.0 * (raw - 0.5)))
+    if lower_body_visibility >= 0.45:
+        raw = 0.90 * raw + 0.10 * lower_body_similarity
+    overall_score = 100.0 / (1.0 + math.exp(-8.0 * (raw - 0.52)))
 
     metrics = PoseMetrics(
         overall_score=overall_score,
+        comparability_score=comparability_score,
+        comparability_label=comparability_label,
+        comparison_confidence_score=comparison_confidence_score,
+        comparison_confidence_label=comparison_confidence_label,
+        upper_body_similarity=upper_body_similarity,
+        lower_body_similarity=lower_body_similarity,
+        lower_body_reliability=lower_body_reliability,
+        torso_projection_similarity=torso_projection_similarity,
         position_similarity=position_similarity,
         angle_similarity=angle_similarity,
+        torso_similarity=torso_similarity,
         symmetry_similarity=symmetry_similarity,
         visibility_ratio=visibility_ratio,
         matched_keypoints=len(shared_ids),
         mean_position_distance=mean_position_distance,
         mean_angle_difference=mean_angle_difference,
+        mean_torso_ratio_delta=mean_torso_ratio_delta,
+        upper_body_visibility=upper_body_visibility,
+        lower_body_visibility=lower_body_visibility,
     )
     return metrics, norm_a, valid_a, norm_b, valid_b
 
@@ -1214,12 +1508,15 @@ def make_overlay_panel(
     _draw_title(panel, "Normalized Overlay", "Blue: image A  Orange: image B")
     stats = [
         f"Pose score: {metrics.overall_score:.1f}/100",
-        f"Angle sim: {metrics.angle_similarity * 100:.1f}",
-        f"Position sim: {metrics.position_similarity * 100:.1f}",
-        f"Symmetry sim: {metrics.symmetry_similarity * 100:.1f}",
+        f"Comparable: {metrics.comparability_label} ({metrics.comparability_score:.0f})",
+        f"Confidence: {metrics.comparison_confidence_label} ({metrics.comparison_confidence_score:.0f})",
+        f"Upper body: {metrics.upper_body_similarity * 100:.1f}",
+        f"Lower body: {metrics.lower_body_similarity * 100:.1f} ({metrics.lower_body_reliability * 100:.0f})",
+        f"Torso proj: {metrics.torso_projection_similarity * 100:.1f}",
+        f"Coverage: U {metrics.upper_body_visibility * 100:.0f} / L {metrics.lower_body_visibility * 100:.0f}",
         f"Matched joints: {metrics.matched_keypoints}/{len(BODY_KEYPOINT_IDS)}",
     ]
-    base_y = panel_size - 114
+    base_y = panel_size - 158
     for idx, line in enumerate(stats):
         cv2.putText(
             panel,
@@ -1261,10 +1558,11 @@ def compose_comparison_image(
     title = "Pose Comparison"
     summary = (
         f"overall={metrics.overall_score:.1f}/100   "
-        f"angle={metrics.angle_similarity * 100:.1f}   "
-        f"position={metrics.position_similarity * 100:.1f}   "
-        f"symmetry={metrics.symmetry_similarity * 100:.1f}   "
-        f"visibility={metrics.visibility_ratio * 100:.1f}"
+        f"comp={metrics.comparability_label}   "
+        f"conf={metrics.comparison_confidence_label}   "
+        f"upper={metrics.upper_body_similarity * 100:.1f}   "
+        f"lower={metrics.lower_body_similarity * 100:.1f}   "
+        f"torso_proj={metrics.torso_projection_similarity * 100:.1f}"
     )
     cv2.putText(
         canvas,
@@ -1332,9 +1630,7 @@ def _visible_hand_indices(
     thr: float,
 ) -> list[int]:
     return [
-        offset + idx
-        for idx in range(21)
-        if _joint_visible(scores, offset + idx, thr)
+        offset + idx for idx in range(21) if _joint_visible(scores, offset + idx, thr)
     ]
 
 
@@ -1356,7 +1652,9 @@ def _hand_is_central(
     return not _point_near_edge(center, pose.image.shape)
 
 
-def _count_visible_fingers(scores: np.ndarray, offset: int, thr: float) -> tuple[int, int]:
+def _count_visible_fingers(
+    scores: np.ndarray, offset: int, thr: float
+) -> tuple[int, int]:
     visible_fingers = 0
     partial_fingers = 0
     for chain in HAND_FINGER_CHAINS.values():
@@ -1383,9 +1681,9 @@ def inspect_pose_structure(
         c_visible = _joint_visible(pose.scores, c, score_thr)
 
         if a_visible and c_visible and not b_visible:
-            if not _point_near_edge(pose.keypoints[a], pose.image.shape) and not _point_near_edge(
-                pose.keypoints[c], pose.image.shape
-            ):
+            if not _point_near_edge(
+                pose.keypoints[a], pose.image.shape
+            ) and not _point_near_edge(pose.keypoints[c], pose.image.shape):
                 issues.append(
                     {
                         "severity": "fail",
@@ -1404,7 +1702,10 @@ def inspect_pose_structure(
             longer = max(upper_length, lower_length)
             if shorter > 1e-6 and longer / shorter >= 3.2:
                 if not _point_near_edge(
-                    np.mean([pose.keypoints[a], pose.keypoints[b], pose.keypoints[c]], axis=0),
+                    np.mean(
+                        [pose.keypoints[a], pose.keypoints[b], pose.keypoints[c]],
+                        axis=0,
+                    ),
                     pose.image.shape,
                 ):
                     issues.append(
@@ -1576,14 +1877,36 @@ def compare_pose_sources(
 
         result: dict[str, Any] = {
             "overall_score": round(metrics.overall_score, 2),
+            "comparability": {
+                "score": round(metrics.comparability_score, 4),
+                "label": metrics.comparability_label,
+            },
+            "comparison_confidence": {
+                "score": round(metrics.comparison_confidence_score, 4),
+                "label": metrics.comparison_confidence_label,
+            },
+            "dimensions": {
+                "upper_body_pose": round(metrics.upper_body_similarity * 100.0, 4),
+                "lower_body_pose": round(metrics.lower_body_similarity * 100.0, 4),
+                "lower_body_reliability": round(
+                    metrics.lower_body_reliability * 100.0, 4
+                ),
+                "torso_projection": round(
+                    metrics.torso_projection_similarity * 100.0, 4
+                ),
+            },
             "angle_similarity": round(metrics.angle_similarity, 4),
             "position_similarity": round(metrics.position_similarity, 4),
+            "torso_similarity": round(metrics.torso_similarity, 4),
             "symmetry_similarity": round(metrics.symmetry_similarity, 4),
             "visibility_ratio": round(metrics.visibility_ratio, 4),
+            "upper_body_visibility": round(metrics.upper_body_visibility, 4),
+            "lower_body_visibility": round(metrics.lower_body_visibility, 4),
             "matched_keypoints": metrics.matched_keypoints,
             "total_keypoints": len(BODY_KEYPOINT_IDS),
             "mean_position_distance": round(metrics.mean_position_distance, 4),
             "mean_angle_difference": round(metrics.mean_angle_difference, 2),
+            "mean_torso_ratio_delta": round(metrics.mean_torso_ratio_delta, 4),
             "models": {
                 "models_dir": str(model_resolution["models_dir"]),
                 "det_model_path": str(model_resolution["det_model_path"]),
